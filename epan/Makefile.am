@@ -141,7 +141,7 @@ libwireshark_la_LIBADD = \
 	dissectors/libdirtydissectors.la dissectors/libfiledissectors.la \
 	wmem/libwmem.la $(wslua_lib) $(wspython_lib) @SOCKET_LIBS@ @NSL_LIBS@ \
 	@C_ARES_LIBS@ @ADNS_LIBS@ @LIBGCRYPT_LIBS@ @LIBGNUTLS_LIBS@ \
-	@KRB5_LIBS@ @SSL_LIBS@ @LIBSMI_LDFLAGS@ @GEOIP_LIBS@ \
+	@KRB5_LIBS@ @SSL_LIBS@ @LIBSMI_LDFLAGS@ @GEOIP_LIBS@ @LIBNGHTTP2_LIBS@\
 	${top_builddir}/wiretap/libwiretap.la @GLIB_LIBS@ \
 	${top_builddir}/wsutil/libwsutil.la -lm
 

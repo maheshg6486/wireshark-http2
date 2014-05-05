@@ -672,6 +672,17 @@ esac
 # FIXME: currently the path argument to with-libsmi is being ignored
 AX_LIBSMI
 
+# libnghttp2
+# FIXME: Add option to disable nghttp2
+PKG_CHECK_MODULES([LIBNGHTTP2], [libnghttp2 >= 0.4.0],
+                  [have_nghttp2=yes], [have_nghttp2=no])
+
+libnghttp2_message="no"
+if (test "${have_nghttp2}" = "yes"); then
+        libnghttp2_message="yes"
+fi
+
+
 #
 # Check for programs used when building DocBook documentation.
 #
@@ -3086,3 +3097,4 @@ echo "     Use POSIX capabilities library : $libcap_message"
 echo "                  Use GeoIP library : $geoip_message"
 echo "                     Use nl library : $libnl_message"
 echo "              Use SBC codec library : $have_sbc"
+echo "                Use nghttp2 library : $libnghttp2_message"

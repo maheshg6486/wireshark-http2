@@ -21,7 +21,7 @@
 noinst_LTLIBRARIES = libdirtydissectors.la libfiledissectors.la libdissectors.la
 
 AM_CPPFLAGS = -I$(srcdir)/../.. -I$(srcdir)/.. \
-	$(LIBGNUTLS_CFLAGS) $(LIBGCRYPT_CFLAGS)
+	$(LIBNGHTTP2_CFLAGS) $(LIBGNUTLS_CFLAGS) $(LIBGCRYPT_CFLAGS)
 
 include Makefile.common
 

@@ -37,13 +37,40 @@
 
 #include "config.h"
 
+#include <stdio.h>
+
 #include <glib.h>
+
+#include <nghttp2/nghttp2.h>
 
 #include <epan/packet.h>
 #include <epan/prefs.h>
 #include <epan/expert.h>
+#include <epan/conversation.h>
+#include <epan/emem.h>
+#include <epan/follow.h>
 
 #include "packet-tcp.h"
+
+/* struct to hold data per HTTP/2 session */
+typedef struct {
+    /* We need 2 inflater object for both client and server.  Since
+       inflater object is symmetrical, we just want to know which
+       inflater is used for each TCP flow.  The hd_inflater_first_flow
+       is used to select which one to use.  Basically, we first record
+       fwd of tcp_analysis in hd_inflater_first_flow and if processing
+       packet_info has fwd of tcp_analysis equal to
+       hd_inflater_first_flow, we use hd_inflater[0], otherwise 2nd
+       one.
+     */
+    nghttp2_hd_inflater *hd_inflater[2];
+    tcp_flow_t *hd_inflater_first_flow;
+} http2_session_t;
+
+typedef struct {
+    /* Hash table, associates TCP stream index to http2_session_t object */
+    GHashTable *sessions;
+} http2_data_t;
 
 void proto_register_http2(void);
 void proto_reg_handoff_http2(void);
@@ -111,6 +138,7 @@ static int hf_http2_window_update_r = -1;
 static int hf_http2_window_update_window_size_increment = -1;
 /* Continuation */
 static int hf_http2_continuation_header = -1;
+static int hf_http2_continuation_padding = -1;
 /* Altsvc */
 static int hf_http2_altsvc_maxage = -1;
 static int hf_http2_altsvc_port = -1;
@@ -237,6 +265,165 @@ static const value_string http2_settings_vals[] = {
     { HTTP2_SETTINGS_COMPRESS_DATA,          "Compress data" },
     { 0, NULL }
 };
+
+static http2_session_t*
+create_http2_session(packet_info *pinfo)
+{
+    conversation_t *conversation;
+    http2_data_t *http2;
+    http2_session_t *h2session;
+    struct tcp_analysis *tcpd;
+    gint *key;
+
+    conversation = find_or_create_conversation(pinfo);
+
+    http2 = (http2_data_t*)conversation_get_proto_data(conversation,
+                                                       proto_http2);
+
+    if(http2 == NULL) {
+        http2 = (http2_data_t*)se_alloc(sizeof(http2_data_t));
+
+        http2->sessions = g_hash_table_new(g_int_hash, g_int_equal);
+
+        conversation_add_proto_data(conversation, proto_http2, http2);
+    }
+
+    tcpd = get_tcp_conversation_data(NULL, pinfo);
+
+    h2session = (http2_session_t*)se_alloc(sizeof(http2_session_t));
+    nghttp2_hd_inflate_new(&h2session->hd_inflater[0]);
+    nghttp2_hd_inflate_new(&h2session->hd_inflater[1]);
+    h2session->hd_inflater_first_flow = tcpd->fwd;
+
+    key = (gint*)se_alloc(sizeof(gint));
+
+    *key = tcpd->stream;
+
+    g_hash_table_insert(http2->sessions, key, h2session);
+
+    return h2session;
+}
+
+static http2_session_t*
+get_http2_session(packet_info *pinfo)
+{
+    conversation_t *conversation;
+    http2_data_t *http2;
+    http2_session_t *h2session;
+    struct tcp_analysis *tcpd;
+    gint key;
+
+    conversation = find_or_create_conversation(pinfo);
+
+    if(!conversation) {
+        fprintf(stderr, "warn: conversation is NULL\n");
+        return NULL;
+    }
+
+    http2 = (http2_data_t*)conversation_get_proto_data(conversation,
+                                                       proto_http2);
+
+    if(!http2) {
+        fprintf(stderr, "warn: http2 is null\n");
+        return NULL;
+    }
+
+    tcpd = get_tcp_conversation_data(NULL, pinfo);
+
+    key = tcpd->stream;
+    h2session = (http2_session_t*)g_hash_table_lookup(http2->sessions, &key);
+
+    if(!h2session) {
+        fprintf(stderr, "warn: h2session is NULL\n");
+    }
+
+    return h2session;
+}
+
+static nghttp2_hd_inflater*
+select_http2_hd_inflater(packet_info *pinfo, http2_session_t *h2session)
+{
+    struct tcp_analysis *tcpd;
+
+    tcpd = get_tcp_conversation_data(NULL, pinfo);
+
+    if(tcpd->fwd == h2session->hd_inflater_first_flow) {
+        return h2session->hd_inflater[0];
+    } else {
+        return h2session->hd_inflater[1];
+    }
+}
+
+static void
+inflate_http2_header_block(tvbuff_t *tvb, packet_info *pinfo, guint offset,
+                           size_t headlen, http2_session_t *h2session,
+                           guint8 flags)
+{
+    uint8_t *headbuf;
+    nghttp2_hd_inflater *hd_inflater;
+    int rv;
+    int final;
+    if(!h2session) {
+        /* We may not be able to track all HTTP/2 session if we miss
+           first magic (connection preface) */
+        return;
+    }
+
+    headbuf = (uint8_t*)se_alloc(headlen);
+    tvb_memcpy(tvb, headbuf, offset, headlen);
+
+    hd_inflater = select_http2_hd_inflater(pinfo, h2session);
+
+    final = flags & HTTP2_FLAGS_END_HEADERS;
+
+    for(;;) {
+        nghttp2_nv nv;
+        int inflate_flags = 0;
+
+        rv = nghttp2_hd_inflate_hd(hd_inflater, &nv,
+                                   &inflate_flags, headbuf, headlen, final);
+
+        if(rv < 0) {
+            fprintf(stderr, "inflate failed with error code %d", rv);
+            break;
+        }
+
+        headbuf += rv;
+        headlen -= rv;
+
+        if(inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
+            char *str = (char *)malloc(nv.namelen + 3 + nv.valuelen);
+
+            memcpy(str, nv.name, nv.namelen);
+            strcpy(&str[nv.namelen], ": ");
+            memcpy(&str[nv.namelen+2], nv.value, nv.valuelen);
+            str[nv.namelen+2+nv.valuelen] = 0;
+
+#if 1
+            /* for debugging */
+            fprintf(stderr, "%s\n", str);
+#endif
+            {
+                /* Now re-setup the tvb buffer to have the new data */
+                tvbuff_t *next_tvb =
+                    tvb_new_child_real_data(tvb, str, nv.namelen+2+nv.valuelen,
+                                            headlen);
+                tvb_set_free_cb(next_tvb, free);
+                add_new_data_source(pinfo, next_tvb, "Decompressed Header");
+            }
+        }
+        if(inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
+            nghttp2_hd_inflate_end_headers(hd_inflater);
+            break;
+        }
+        if((inflate_flags & NGHTTP2_HD_INFLATE_EMIT) == 0 &&
+           headlen == 0) {
+            break;
+        }
+    }
+
+    fprintf(stderr, "\n");
+}
 
 static guint8
 dissect_http2_header_flags(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *http2_tree, guint offset, guint8 type)
@@ -370,13 +557,19 @@ dissect_http2_headers(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *http2_t
 {
     guint16 padding;
     gint headlen;
+    http2_session_t *h2session;
+
+    h2session = get_http2_session(pinfo);
 
     offset = dissect_frame_padding(tvb, &padding, http2_tree, offset, flags);
     offset = dissect_frame_prio(tvb, http2_tree, offset, flags);
 
-    /* TODO : Support header decompression */
     headlen = tvb_reported_length_remaining(tvb, offset) - padding;
     proto_tree_add_item(http2_tree, hf_http2_headers, tvb, offset, headlen, ENC_ASCII|ENC_NA);
+
+    /* decompress the header block */
+    inflate_http2_header_block(tvb, pinfo, offset, headlen, h2session, flags);
+
     offset += headlen;
 
     proto_tree_add_item(http2_tree, hf_http2_headers_padding, tvb, offset, padding, ENC_NA);
@@ -414,6 +607,10 @@ dissect_http2_settings(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *http2_
     guint32 settingsid;
     proto_item *ti_settings;
     proto_tree *settings_tree;
+
+    /* FIXME: If we send SETTINGS_HEADER_TABLE_SIZE, aAfter receiving
+       ACK from peer, we have to apply its value to HPACK decoder
+       using nghttp2_hd_inflate_change_table_size() */
 
     while(tvb_reported_length_remaining(tvb, offset) > 0){
 
@@ -459,7 +656,10 @@ dissect_http2_push_promise(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *ht
                            guint offset, guint8 flags _U_)
 {
     guint16 padding;
-    gint headerfrag;
+    gint headlen;
+    http2_session_t *h2session;
+
+    h2session = get_http2_session(pinfo);
 
     offset = dissect_frame_padding(tvb, &padding, http2_tree, offset, flags);
 
@@ -469,11 +669,13 @@ dissect_http2_push_promise(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *ht
     offset += 4;
 
     /* TODO : Support header decompression */
-    headerfrag = tvb_reported_length_remaining(tvb, offset) - padding;
-    proto_tree_add_item(http2_tree, hf_http2_push_promise_header, tvb, offset, headerfrag,
+    headlen = tvb_reported_length_remaining(tvb, offset) - padding;
+    proto_tree_add_item(http2_tree, hf_http2_push_promise_header, tvb, offset, headlen,
                         ENC_ASCII|ENC_NA);
 
-    offset += headerfrag;
+    inflate_http2_header_block(tvb, pinfo, offset, headlen, h2session, flags);
+
+    offset += headlen;
 
     proto_tree_add_item(http2_tree, hf_http2_push_promise_padding, tvb,
                         offset, padding, ENC_NA);
@@ -532,12 +734,27 @@ dissect_http2_window_update(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *h
 }
 
 static int
-dissect_http2_continuation(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *http2_tree, guint offset, guint8 flags _U_)
+dissect_http2_continuation(tvbuff_t *tvb, packet_info *pinfo _U_, proto_tree *http2_tree, guint offset, guint8 flags)
 {
+    guint16 padding;
+    gint headlen;
+    http2_session_t *h2session;
+
+    h2session = get_http2_session(pinfo);
+
+    offset = dissect_frame_padding(tvb, &padding, http2_tree, offset, flags);
 
     /* TODO : Support "Reassemble Header" and header decompression */
-    proto_tree_add_item(http2_tree, hf_http2_continuation_header, tvb, offset, -1, ENC_ASCII|ENC_NA);
-    offset +=  tvb_reported_length_remaining(tvb, offset);
+    headlen = tvb_reported_length_remaining(tvb, offset) - padding;
+    proto_tree_add_item(http2_tree, hf_http2_continuation_header, tvb, offset, headlen, ENC_ASCII|ENC_NA);
+
+    inflate_http2_header_block(tvb, pinfo, offset, headlen, h2session, flags);
+
+    offset +=  headlen;
+
+    proto_tree_add_item(http2_tree, hf_http2_continuation_padding, tvb, offset, padding, ENC_NA);
+
+    offset += padding;
 
     return offset;
 }
@@ -630,6 +847,9 @@ dissect_http2_pdu(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* dat
         proto_item_append_text(ti, ": Magic");
 
         proto_tree_add_item(http2_tree, hf_http2_magic, tvb, offset, MAGIC_FRAME_LENGTH, ENC_ASCII|ENC_NA);
+
+        create_http2_session(pinfo);
+
         return MAGIC_FRAME_LENGTH;
     }
 
@@ -1031,6 +1251,11 @@ proto_register_http2(void)
             { "Continuation Header", "http2.continuation.header",
                FT_STRING, BASE_NONE, NULL, 0x0,
               "Contains a header block fragment", HFILL }
+        },
+        { &hf_http2_continuation_padding,
+            { "Padding", "http2.continuation.padding",
+               FT_BYTES, BASE_NONE, NULL, 0x0,
+              "Padding octets", HFILL }
         },
 
         /* Altsvc */
